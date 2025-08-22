@@ -1,0 +1,137 @@
+name: Amplify Backend Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: amplify-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      HUSKY: 0
+    
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.npm
+            node_modules
+            .next/cache
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+      
+      - name: Auto-Fix Linting Issues
+        id: lint-fix
+        run: |
+          echo "🔧 Attempting to auto-fix lint issues..."
+          npm run lint:fix || npx eslint . --fix --ext .js,.jsx,.ts,.tsx || true
+          
+          if git diff --quiet; then
+            echo "✅ No lint issues found or fixed"
+            echo "fixed=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔧 Lint issues were auto-fixed"
+            echo "fixed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Auto-Fix Prettier Formatting
+        id: prettier-fix
+        run: |
+          echo "🎨 Attempting to auto-fix formatting..."
+          npx prettier --write "**/*.js" "**/*.jsx" "**/*.ts" "**/*.tsx" "**/*.css" "**/*.md" "**/*.json" --ignore-path .gitignore || true
+          
+          if git diff --quiet; then
+            echo "✅ No formatting issues"
+            echo "fixed=false" >> $GITHUB_OUTPUT
+          else
+            echo "🎨 Formatting was auto-fixed"
+            echo "fixed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Commit Auto-Fixes
+        if: steps.lint-fix.outputs.fixed == 'true' || steps.prettier-fix.outputs.fixed == 'true'
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          
+          git add -A
+          git commit -m "🤖 Auto-fix: linting and formatting issues [skip ci]"
+          git push origin "main"
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+      
+      - name: Trigger Amplify Build
+        run: |
+          # Start a new Amplify build job
+          JOB_ID=$(aws amplify start-job \
+            --app-id d20m2cekw2dhk7 \
+            --branch-name main \
+            --job-type RELEASE \
+            --region eu-north-1 \
+            --query 'jobSummary.jobId' \
+            --output text)
+          
+          echo "Started Amplify build job: $JOB_ID"
+          
+          # Wait for the job to complete (max 30 minutes)
+          COUNTER=0
+          MAX_ATTEMPTS=60
+          
+          while [ $COUNTER -lt $MAX_ATTEMPTS ]; do
+            STATUS=$(aws amplify get-job \
+              --app-id d20m2cekw2dhk7 \
+              --branch-name main \
+              --job-id "$JOB_ID" \
+              --region eu-north-1 \
+              --query 'job.summary.status' \
+              --output text)
+            
+            echo "Build status: $STATUS (attempt $((COUNTER+1))/$MAX_ATTEMPTS)"
+            
+            if [[ "$STATUS" == "SUCCEED" ]]; then
+              echo "✅ Amplify build completed successfully!"
+              break
+            elif [[ "$STATUS" == "FAILED" ]] || [[ "$STATUS" == "CANCELLED" ]]; then
+              echo "❌ Amplify build failed with status: $STATUS"
+              exit 1
+            fi
+            
+            sleep 30
+            COUNTER=$((COUNTER+1))
+          done
+          
+          if [ $COUNTER -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Build timed out after 30 minutes"
+            exit 1
+          fi
